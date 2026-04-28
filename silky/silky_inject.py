@@ -66,29 +66,49 @@ def _parse_json_first_int(arg_line: str) -> int:
     return 0
 
 
-def _try_match_ruby(lines, str_idx, total):
-    """识别 ruby 段。详见 silky_extract._try_match_ruby。"""
-    if str_idx + 11 >= total:
+def _try_match_ruby(lines, tns_idx, total):
+    """识别 ruby 段（从 TO_NEW_STRING [1] 起）。详见 silky_extract._try_match_ruby_at_tns。"""
+    if tns_idx + 1 >= total:
         return None
-    if (lines[str_idx].rstrip('\n') != '#1-STR_CRYPT' or
-        lines[str_idx + 2].rstrip('\n') != '#1-TO_NEW_STRING' or
-        lines[str_idx + 4].rstrip('\n') != '#1-STR_UNCRYPT' or
-        lines[str_idx + 6].rstrip('\n') != '#1-STR_CRYPT' or
-        lines[str_idx + 8].rstrip('\n') != '#1-RETURN' or
-        lines[str_idx + 10].rstrip('\n') != '#1-STR_CRYPT'):
+    if lines[tns_idx].rstrip('\n') != '#1-TO_NEW_STRING':
         return None
-    if _parse_json_first_int(lines[str_idx + 3].rstrip('\n')) != 1:
+    if _parse_json_first_int(lines[tns_idx + 1].rstrip('\n')) != 1:
         return None
-    sep = _parse_json_str(lines[str_idx + 5].rstrip('\n'))
-    if sep != ' ':
+
+    j = tns_idx + 2
+    inner = []
+    while j < total:
+        op = lines[j].rstrip('\n')
+        if op == '#1-RETURN':
+            break
+        if op not in ('#1-STR_CRYPT', '#1-STR_UNCRYPT'):
+            return None
+        if j + 1 >= total:
+            return None
+        val = _parse_json_str(lines[j + 1].rstrip('\n'))
+        if op == '#1-STR_UNCRYPT':
+            kind = 'sep_uncrypt'
+        elif val == '\u3000':
+            kind = 'sep_full'
+        else:
+            kind = 'reading'
+        inner.append((j + 1, val, kind))
+        j += 2
+
+    if not inner:
         return None
+    if j >= total or lines[j].rstrip('\n') != '#1-RETURN':
+        return None
+    j += 2
+    if j + 1 >= total or lines[j].rstrip('\n') != '#1-STR_CRYPT':
+        return None
+    base_arg_idx = j + 1
+    end_idx = j + 2
+
     return {
-        'prev_arg_idx': str_idx + 1,
-        'sep_arg_idx': str_idx + 5,
-        'reading_arg_idx': str_idx + 7,
-        'base_arg_idx': str_idx + 11,
-        'orig_reading': _parse_json_str(lines[str_idx + 7].rstrip('\n')),
-        'end_idx': str_idx + 12,
+        'reading_slots': inner,
+        'base_arg_idx': base_arg_idx,
+        'end_idx': end_idx,
     }
 
 
@@ -148,13 +168,22 @@ def _collect_text_block(lines, start, total):
             i += 2
             continue
 
-        if cl in _STR_OPCODE_LINES:
-            ruby = _try_match_ruby(lines, i, total)
-            if ruby is not None:
-                text_parts.append(('ruby', ruby))
-                i = ruby['end_idx']
+        if cl == '#1-TO_NEW_STRING':
+            arg_val = _parse_json_first_int(lines[i + 1].rstrip('\n')) if i + 1 < total else -1
+            if arg_val == 1:
+                ruby = _try_match_ruby(lines, i, total)
+                if ruby is not None:
+                    text_parts.append(('ruby', ruby))
+                    i = ruby['end_idx']
+                    continue
+            elif arg_val == 0:
+                text_parts.append(('newline',))
+                i += 2
                 continue
+            i += 2
+            continue
 
+        if cl in _STR_OPCODE_LINES:
             arg_line = lines[i + 1].rstrip('\n') if i + 1 < total else '[]'
             text_val = _parse_json_str(arg_line)
             text_parts.append(('text', i + 1, text_val))
@@ -178,15 +207,19 @@ def _collect_text_block(lines, start, total):
 def import_text(opcode_txt_path: str, text_txt_path: str, output_txt_path: str) -> int:
     """把 translate.txt 的 ◆ 行注入回 op.txt 的 STR 参数行。
 
+    每个 ◆ 条目对应一个 STR (text 或 ruby base) 或一个 name。1:1 严格对应，
+    顺序与 extract_text 完全一致。注音 reading 不在译文里，注入时按原 reading
+    去 \\u3000 后的字符数填全角空格占位。
+
     translate.txt 行格式：
-      ◆0001◆name◆角色译名         (角色名条目)
-      ◆0002◆译文段1\\n译文段2\\n... (文本条目，\\n 分隔多 STR)
+      ◆0001◆name◆角色译名     (角色名条目)
+      ◆0002◆译文一句          (普通文本 / ruby base)
 
     返回成功扫描的条目数。
     """
-    # 1. 读 translate.txt，解析所有 ◆ 行
-    translations = {}      # seq_idx -> translated string
-    name_translations = {} # seq_idx -> translated name
+    # 1. 读 translate.txt，把所有 ◆ 行按 seq 索引存
+    translations = {}      # seq -> 文本译文
+    name_translations = {} # seq -> 角色名译文
     with open(text_txt_path, 'r', encoding='utf-8-sig') as f:
         for tline in f:
             tline = tline.rstrip('\n')
@@ -205,7 +238,7 @@ def import_text(opcode_txt_path: str, text_txt_path: str, output_txt_path: str) 
                 except ValueError:
                     pass
 
-    # 2. 读原 op.txt，按 extract 同样的逻辑遍历
+    # 2. 读原 op.txt
     with open(opcode_txt_path, 'r', encoding='utf-8-sig') as f:
         lines = f.readlines()
 
@@ -213,55 +246,80 @@ def import_text(opcode_txt_path: str, text_txt_path: str, output_txt_path: str) 
     i = 0
     total = len(lines)
 
+    def _flush_block(text_parts):
+        """整块写回。
+
+        extract 时的拼接规则：text + ruby_base 直接相邻，TNS[0] 处插字面 \\n。
+        所以一个 trans_part（按 \\n 拆出来的一段）可能对应**多个**连续的 text/ruby 槽位。
+
+        写回策略：把 text_parts 按 newline 切成"段组"，每个段组对应一个 trans_part。
+        段组内的所有 text/ruby 槽位**共享**同一段译文 — 但段组内通常只有 1 或 2 个槽位
+        （比如 [text("「"), ruby{...}] = "「" + base，或单个 text）。
+        多槽位段组的写回方式：第一个槽位拿整段译文，其余清空。
+        译者要保持原文的 text 边界，最简单的做法是不拆分 — 一段译文直接整段塞给段组首个槽位。
+        """
+        nonlocal seq
+        # 计算块内是否有"翻译槽位"
+        n_slots = sum(1 for p in text_parts if p[0] in ('text', 'ruby'))
+        if n_slots == 0:
+            return
+
+        # 按 newline 切分 text_parts 成"段组"
+        groups = [[]]
+        for p in text_parts:
+            if p[0] == 'newline':
+                groups.append([])
+            else:
+                groups[-1].append(p)
+        # 去掉空段组（理论上不该有）
+        groups = [g for g in groups if g]
+
+        trans = translations.get(seq, '')
+        trans_parts = trans.split('\\n') if trans else []
+
+        for gi, group in enumerate(groups):
+            seg_text = trans_parts[gi] if gi < len(trans_parts) else ''
+            # 段组内多个槽位：第一个 text/ruby base 拿整段译文，其余清空
+            assigned = False
+            for p in group:
+                if p[0] == 'text':
+                    arg_idx = p[1]
+                    if seq in translations:
+                        new_val = seg_text if not assigned else ''
+                        lines[arg_idx] = json.dumps([new_val], ensure_ascii=False) + '\n'
+                        assigned = True
+                elif p[0] == 'ruby':
+                    r = p[1]
+                    # ruby 内部 reading 槽位填全角空格占位，sep 保留
+                    for arg_idx, orig_val, kind in r['reading_slots']:
+                        if kind == 'reading':
+                            n_chars = len(orig_val.replace('\u3000', ''))
+                            filler = '\u3000' * n_chars
+                            lines[arg_idx] = json.dumps([filler], ensure_ascii=False) + '\n'
+                    # base
+                    if seq in translations:
+                        new_val = seg_text if not assigned else ''
+                        lines[r['base_arg_idx']] = json.dumps([new_val], ensure_ascii=False) + '\n'
+                        assigned = True
+        seq += 1
+
     while i < total:
         line = lines[i].rstrip('\n')
 
         is_message_block = (line == '#1-MESSAGE')
-        is_standalone_str = (line in _STR_OPCODE_LINES)
+        is_str_or_tns = (line in _STR_OPCODE_LINES) or (line == '#1-TO_NEW_STRING')
 
         if is_message_block:
             i += 2
 
-        if is_message_block or is_standalone_str:
+        if is_message_block or is_str_or_tns:
             text_parts, i, block_name, name_line_idx = _collect_text_block(lines, i, total)
-            if text_parts:
-                # 角色名占一个 seq
-                if block_name is not None:
-                    if name_line_idx is not None and seq in name_translations:
-                        trans_name = name_translations[seq]
-                        lines[name_line_idx] = json.dumps([trans_name], ensure_ascii=False) + '\n'
-                    seq += 1
-
-                # 对话文本占一个 seq
-                if seq in translations:
-                    trans = translations[seq]
-                    trans_parts = trans.split('\\n')
-
-                    # text_parts 里每个 'text' 占用 1 段，每个 'ruby' 占用 2 段（前文 + base）
-                    # ruby 的 reading 不在译文里，注入时按原 reading 字符数填全角空格
-                    cursor = 0
-                    for p in text_parts:
-                        if p[0] == 'text':
-                            arg_idx = p[1]
-                            new_val = trans_parts[cursor] if cursor < len(trans_parts) else ""
-                            lines[arg_idx] = json.dumps([new_val], ensure_ascii=False) + '\n'
-                            cursor += 1
-                        elif p[0] == 'ruby':
-                            r = p[1]
-                            seg_prev = trans_parts[cursor] if cursor < len(trans_parts) else ""
-                            seg_base = trans_parts[cursor + 1] if cursor + 1 < len(trans_parts) else ""
-                            cursor += 2
-                            # reading 填等量 \u3000 占位：
-                            #   按原 reading 去掉 \u3000 后的"实际假名数"作为占位字符数
-                            #   稀疏型 'な\u3000お\u3000や' (5 字符 / 3 假名) → 填 3 个 \u3000
-                            #   紧凑型 'ななせ' (3 字符) → 填 3 个 \u3000
-                            n_chars = len(r['orig_reading'].replace('\u3000', ''))
-                            filler = '\u3000' * n_chars
-                            lines[r['prev_arg_idx']] = json.dumps([seg_prev], ensure_ascii=False) + '\n'
-                            lines[r['reading_arg_idx']] = json.dumps([filler], ensure_ascii=False) + '\n'
-                            lines[r['base_arg_idx']] = json.dumps([seg_base], ensure_ascii=False) + '\n'
-
+            if block_name is not None:
+                if name_line_idx is not None and seq in name_translations:
+                    trans_name = name_translations[seq]
+                    lines[name_line_idx] = json.dumps([trans_name], ensure_ascii=False) + '\n'
                 seq += 1
+            _flush_block(text_parts)
         else:
             i += 1
 

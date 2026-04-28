@@ -144,52 +144,65 @@ def _detect_name_block(lines, i, total):
 # 对话块收集
 # ============================================================
 
-def _try_match_ruby(lines, str_idx, total):
-    """检查 str_idx (一个 #1-STR_CRYPT 行) 后面是否紧跟一个完整的 ruby 段。
+def _try_match_ruby_at_tns(lines, tns_idx, total):
+    """检查 tns_idx (一个 #1-TO_NEW_STRING 行) 是否启动一个 ruby 段。
 
-    Pattern (相对偏移):
-      str_idx + 0: #1-STR_CRYPT (前文)
-      str_idx + 1: ["前文"]
-      str_idx + 2: #1-TO_NEW_STRING
-      str_idx + 3: [1]
-      str_idx + 4: #1-STR_UNCRYPT
-      str_idx + 5: [" "]
-      str_idx + 6: #1-STR_CRYPT
-      str_idx + 7: ["reading"]
-      str_idx + 8: #1-RETURN
-      str_idx + 9: []
-      str_idx + 10: #1-STR_CRYPT
-      str_idx + 11: ["base"]
+    通用 ruby 结构（从 TNS[1] 开始；不假设前文存在）：
+      tns_idx + 0:  #1-TO_NEW_STRING
+      tns_idx + 1:  [1]                       ← arg=1 是 ruby 信号
+      ── ruby 内部，任意条 STR_CRYPT/STR_UNCRYPT ──
+        STR_UNCRYPT [" "]   → sep
+        STR_CRYPT  ["　"]   → sep（单全角空格）
+        STR_CRYPT  ["abc"]  → reading
+      ── ruby 结束 ──
+      #1-RETURN []
+      #1-STR_CRYPT ["base"]
 
-    返回 (prev_arg_idx, sep_arg_idx, reading_arg_idx, base_arg_idx, prev_text, reading, base, end_idx)
-    或 None。
+    返回 dict 含：base_arg_idx, reading_slots, end_idx，或 None。
     """
-    if str_idx + 11 >= total:
+    if tns_idx + 1 >= total:
         return None
-    if (lines[str_idx].rstrip('\n') != '#1-STR_CRYPT' or
-        lines[str_idx + 2].rstrip('\n') != '#1-TO_NEW_STRING' or
-        lines[str_idx + 4].rstrip('\n') != '#1-STR_UNCRYPT' or
-        lines[str_idx + 6].rstrip('\n') != '#1-STR_CRYPT' or
-        lines[str_idx + 8].rstrip('\n') != '#1-RETURN' or
-        lines[str_idx + 10].rstrip('\n') != '#1-STR_CRYPT'):
+    if lines[tns_idx].rstrip('\n') != '#1-TO_NEW_STRING':
         return None
-    if _parse_json_first_int(lines[str_idx + 3].rstrip('\n')) != 1:
+    if _parse_json_first_int(lines[tns_idx + 1].rstrip('\n')) != 1:
         return None
-    sep = _parse_json_str(lines[str_idx + 5].rstrip('\n'))
-    if sep != ' ':
+
+    j = tns_idx + 2
+    inner = []
+    while j < total:
+        op = lines[j].rstrip('\n')
+        if op == '#1-RETURN':
+            break
+        if op not in ('#1-STR_CRYPT', '#1-STR_UNCRYPT'):
+            return None
+        if j + 1 >= total:
+            return None
+        val = _parse_json_str(lines[j + 1].rstrip('\n'))
+        if op == '#1-STR_UNCRYPT':
+            kind = 'sep_uncrypt'
+        elif val == '\u3000':
+            kind = 'sep_full'
+        else:
+            kind = 'reading'
+        inner.append((j + 1, val, kind))
+        j += 2
+
+    if not inner:
         return None
-    prev_text = _parse_json_str(lines[str_idx + 1].rstrip('\n'))
-    reading = _parse_json_str(lines[str_idx + 7].rstrip('\n'))
-    base = _parse_json_str(lines[str_idx + 11].rstrip('\n'))
+    if j >= total or lines[j].rstrip('\n') != '#1-RETURN':
+        return None
+    j += 2
+    if j + 1 >= total or lines[j].rstrip('\n') != '#1-STR_CRYPT':
+        return None
+    base_arg_idx = j + 1
+    base = _parse_json_str(lines[base_arg_idx].rstrip('\n'))
+    end_idx = j + 2
+
     return {
-        'prev_arg_idx': str_idx + 1,
-        'sep_arg_idx': str_idx + 5,
-        'reading_arg_idx': str_idx + 7,
-        'base_arg_idx': str_idx + 11,
-        'prev_text': prev_text,
-        'reading': reading,
+        'reading_slots': inner,
+        'base_arg_idx': base_arg_idx,
         'base': base,
-        'end_idx': str_idx + 12,  # 下一个待扫描位置
+        'end_idx': end_idx,
     }
 
 
@@ -216,14 +229,25 @@ def _collect_text_block(lines, start, total):
             i += 2
             continue
 
-        if cl in _STR_OPCODE_LINES:
-            # 看是不是 ruby 段开头
-            ruby = _try_match_ruby(lines, i, total)
-            if ruby is not None:
-                text_parts.append(('ruby', ruby))
-                i = ruby['end_idx']
+        # ruby 段：以 TO_NEW_STRING [1] 起始
+        if cl == '#1-TO_NEW_STRING':
+            arg_val = _parse_json_first_int(lines[i + 1].rstrip('\n')) if i + 1 < total else -1
+            if arg_val == 1:
+                ruby = _try_match_ruby_at_tns(lines, i, total)
+                if ruby is not None:
+                    text_parts.append(('ruby', ruby))
+                    i = ruby['end_idx']
+                    continue
+            elif arg_val == 0:
+                # 真正的换段信号 → 输出 \n
+                text_parts.append(('newline',))
+                i += 2
                 continue
+            # 异常 arg 值（不是 0 也不是 1），跳过
+            i += 2
+            continue
 
+        if cl in _STR_OPCODE_LINES:
             arg_line = lines[i + 1].rstrip('\n') if i + 1 < total else '[]'
             text_val = _parse_json_str(arg_line)
             text_parts.append(('text', i + 1, text_val))
@@ -250,38 +274,25 @@ def _collect_text_block(lines, start, total):
     return text_parts, i, detected_name, name_arg_line_idx
 
 
-def _build_display_text(parts):
-    """把 text_parts 拼成展示串。
-
-    - 'text' part：直接用文本
-    - 'ruby' part：展示为 "前文\\nbase"，注音 reading 不暴露给译者
-      （注入时 reading 位置会自动填充等长全角空格）
-    """
-    out = []
-    for p in parts:
-        if p[0] == 'text':
-            out.append(p[2])
-        elif p[0] == 'ruby':
-            r = p[1]
-            out.append(r['prev_text'] + '\\n' + r['base'])
-    return '\\n'.join(out)
-
-
 # ============================================================
 # 主入口
 # ============================================================
 
 def extract_text(opcode_txt_path: str, text_txt_path: str) -> int:
-    """从 op.txt 提取所有 STR_CRYPT/STR_UNCRYPT 文本，写出 GalTransl 双行格式 translate.txt。
+    """从 op.txt 提取所有需要翻译的字符串，写出 GalTransl 双行格式 translate.txt。
+
+    一个对话块（MESSAGE 起点 → 块结束 op）的多个 STR 用 \\n 拼成一条，让译者
+    看到完整句子上下文。注音 reading 不暴露（注入时填全角空格占位），但 ruby
+    的 base 与同块其他 STR 一起进入 \\n 拼接。
 
     输出格式：
-      ◇0000◇原文
-      ◆0000◆原文 (待翻译)
-                          <- 空行分隔
-      ◇0001◇下一条
+      ◇0000◇句1\\n句2\\n句3
+      ◆0000◆句1\\n句2\\n句3
+                              <- 空行分隔
+      ◇0001◇下一块
       ...
 
-    角色名占独立条目：
+    角色名条目独立占一条：
       ◇0001◇name◇角色名
       ◆0001◆name◆角色名
 
@@ -291,42 +302,55 @@ def extract_text(opcode_txt_path: str, text_txt_path: str) -> int:
         lines = f.readlines()
 
     total = len(lines)
-    entries = []  # (block_name_or_None, text_parts)
+    entries = []  # ('name', name_str) 或 ('text', joined_str)
     i = 0
+
+    def _join_parts(parts):
+        """按 newline 标记决定 \\n 位置；普通 STR 之间和 ruby 段内部都直接相邻拼接。"""
+        out = []
+        for p in parts:
+            if p[0] == 'text':
+                out.append(p[2])
+            elif p[0] == 'ruby':
+                out.append(p[1]['base'])
+            elif p[0] == 'newline':
+                out.append('\\n')
+        return ''.join(out)
 
     while i < total:
         line = lines[i].rstrip('\n')
 
         if line == '#1-MESSAGE':
-            # 跳过 MESSAGE op + 它的 arg 行
             i += 2
             text_parts, i, block_name, _ = _collect_text_block(lines, i, total)
-            if text_parts:
-                entries.append((block_name, text_parts))
+            if block_name is not None:
+                entries.append(('name', block_name))
+            joined = _join_parts(text_parts)
+            if joined:
+                entries.append(('text', joined))
 
-        elif line in _STR_OPCODE_LINES:
+        elif line in _STR_OPCODE_LINES or line == '#1-TO_NEW_STRING':
             text_parts, i, block_name, _ = _collect_text_block(lines, i, total)
-            if text_parts:
-                entries.append((block_name, text_parts))
+            if block_name is not None:
+                entries.append(('name', block_name))
+            joined = _join_parts(text_parts)
+            if joined:
+                entries.append(('text', joined))
         else:
             i += 1
 
     # 写出 ◇/◆ 双行格式
-    seq = 0
     with open(text_txt_path, 'w', encoding='utf-8-sig') as out:
-        for name, parts in entries:
-            if name is not None:
-                out.write(f'\u25c7{seq:04d}\u25c7name\u25c7{name}\n')
-                out.write(f'\u25c6{seq:04d}\u25c6name\u25c6{name}\n')
-                seq += 1
-                out.write('\n')
-            display = _build_display_text(parts)
-            out.write(f'\u25c7{seq:04d}\u25c7{display}\n')
-            out.write(f'\u25c6{seq:04d}\u25c6{display}\n')
+        for seq, (kind, val) in enumerate(entries):
+            if kind == 'name':
+                out.write(f'\u25c7{seq:04d}\u25c7name\u25c7{val}\n')
+                out.write(f'\u25c6{seq:04d}\u25c6name\u25c6{val}\n')
+            else:
+                out.write(f'\u25c7{seq:04d}\u25c7{val}\n')
+                out.write(f'\u25c6{seq:04d}\u25c6{val}\n')
             out.write('\n')
-            seq += 1
 
-    return seq
+    return len(entries)
 
 
 if __name__ == "__main__":
