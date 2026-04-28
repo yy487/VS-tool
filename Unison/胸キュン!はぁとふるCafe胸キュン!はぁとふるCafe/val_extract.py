@@ -5,23 +5,38 @@ Lazy 引擎 .VAL 剧情文本提取工具
 ================================
 
 用法:
-    python3 val_extract.py <input_dir> <output_dir>
+    python3 val_extract.py <input_dir> <output_dir> [--min-items N]
 
 行为:
-    遍历 <input_dir> 下所有 .VAL 文件, 仅对剧情脚本 (classify_val == 'story')
-    提取由 0xdd opcode 引用、且内容含日文/日式标点的字符串.
+    遍历 <input_dir> 下所有 .VAL 文件 (无差别处理), 扫描每个文件中
+    由 0xdd opcode 引用、且内容含日文/日式标点的字符串.
+
+    判定方式 (内容驱动, 不依赖文件名):
+      - 文件至少含 N 条剧情字符串 (默认 N=1) -> 输出 JSON
+      - 否则跳过, 不写 JSON
+    inject 阶段会把没 JSON 的 .VAL 原样拷贝过去.
 
     每个剧情脚本输出一份 GalTransl 兼容 JSON:
         [
-          {"name": "", "message": "日文文本"},
+          {"name": "", "message": "日文文本", "_chunks": [...]},
           ...
         ]
 
     JSON 顺序 = seg_A 中 dd 站点出现顺序 (= 剧情时间线).
-    同一字符串在 seg_B 中若被多个站点引用, 也会在 JSON 里出现多次;
-    GalTransl 翻译时会自动去重保持一致.
 
-    每条记录额外携带 _site / _idx 两个内部字段, 用于 inject 阶段精确回写.
+跨条台词合并:
+    引擎经常把一句 「...」 拆成多条 0xdd 显示 (分页换行的设计).
+    extract 时若发现 message 含「但缺对应」, 自动向后合并直到闭合.
+    被合并掉的后续条目, 其内容 + idx 记录在主条目的 _chunks 数组里;
+    JSON 里只保留合并后的"主条目", 翻译时面对完整句子.
+
+    inject 阶段: 主条目的译文写到第 1 个 chunk 的 idx, 其余 chunk 的 idx
+    写空字符串 (引擎会显示空, 但分页节奏保留).
+
+内部字段 (GalTransl 不会动, inject 用):
+    _site:    seg_A 中 dd 指令的偏移 (主条目)
+    _idx:     该条目对应的 seg_B 索引 (主条目, = _chunks[0]._idx)
+    _chunks:  [{"_idx": int, "src": str}, ...]  原始每段的 idx 与原文 (含主条目本身)
 """
 import os
 import sys
@@ -30,8 +45,56 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lazy_common import (
-    ValFile, classify_val, collect_story_refs, decode_sjis,
+    ValFile, collect_story_refs, decode_sjis,
 )
+
+
+# 用于"未闭合台词"判定的成对符号 (开 -> 闭)
+_PAIRS = [('「', '」'), ('『', '』')]
+_OPENS  = ''.join(o for o, _ in _PAIRS)
+_CLOSES = ''.join(c for _, c in _PAIRS)
+
+
+def _balance(s: str) -> int:
+    """返回 s 中开括号数 - 闭括号数; > 0 说明有未闭合的开括号."""
+    return (sum(s.count(o) for o in _OPENS)
+            - sum(s.count(c) for c in _CLOSES))
+
+
+def _merge_unclosed(records: list) -> list:
+    """
+    把"开了 quote 但本条未闭"的记录与后续条合并,
+    直到整体平衡 (或耗尽前瞻).
+    输入: [{name, message, _site, _idx}, ...]   (extract 阶段构造的原子记录)
+    输出: [{name, message, _site, _idx, _chunks: [...]}, ...]
+    """
+    MAX_LOOKAHEAD = 8   # 最多向后吸收 8 条; 防止异常情况无限合并
+    out = []
+    i = 0
+    n = len(records)
+    while i < n:
+        cur = records[i]
+        chunks = [{'_idx': cur['_idx'], 'src': cur['message']}]
+        msg = cur['message']
+        bal = _balance(msg)
+        j = i + 1
+        steps = 0
+        while bal > 0 and j < n and steps < MAX_LOOKAHEAD:
+            nx = records[j]
+            chunks.append({'_idx': nx['_idx'], 'src': nx['message']})
+            msg += nx['message']
+            bal = _balance(msg)
+            j += 1
+            steps += 1
+        out.append({
+            'name':    cur['name'],
+            'message': msg,
+            '_site':   cur['_site'],
+            '_idx':    cur['_idx'],
+            '_chunks': chunks,
+        })
+        i = j  # 跳过被吸收的条目
+    return out
 
 
 def extract_one(val_path: str, out_json_path: str) -> dict:
@@ -40,26 +103,29 @@ def extract_one(val_path: str, out_json_path: str) -> dict:
     v = ValFile.parse(data)
     refs = collect_story_refs(v)
 
-    items = []
+    # 原子记录 (每个 dd 站点一条)
+    atoms = []
     for site, idx in refs:
-        items.append({
-            'name': '',
+        atoms.append({
+            'name':    '',
             'message': decode_sjis(v.strings[idx]),
-            # 内部对账字段; GalTransl 不动它们, inject 时按这两个字段精确回写
-            '_site': site,
-            '_idx': idx,
+            '_site':   site,
+            '_idx':    idx,
         })
 
-    with open(out_json_path, 'w', encoding='utf-8') as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    # 合并未闭合台词
+    items = _merge_unclosed(atoms)
 
     return {
-        'val': os.path.basename(val_path),
-        'json': os.path.basename(out_json_path),
-        'ref_count': len(refs),
-        'distinct_idx': len({idx for _, idx in refs}),
-        'string_count': len(v.strings),
-        'seg_a_size': len(v.seg_a),
+        'val':           os.path.basename(val_path),
+        'json':          os.path.basename(out_json_path),
+        'ref_count':     len(refs),
+        'item_count':    len(items),
+        'merged_count':  len(refs) - len(items),
+        'distinct_idx':  len({idx for _, idx in refs}),
+        'string_count':  len(v.strings),
+        'seg_a_size':    len(v.seg_a),
+        '_items':        items,   # 内部传出, main 决定是否落盘
     }
 
 
@@ -67,12 +133,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('input_dir',  help='解包后的 .VAL 目录 (包含 _vct_meta.json)')
     ap.add_argument('output_dir', help='输出 JSON 目录')
+    ap.add_argument('--min-items', type=int, default=1,
+                    help='文件至少有这么多条剧情才输出 JSON (默认 1, 即只要有剧情就输出)')
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    summary = {'story': [], 'system_skipped': []}
+    summary = {'story': [], 'no_story_skipped': []}
     total_refs = 0
+    total_items = 0
+    total_merged = 0
 
     for fname in sorted(os.listdir(args.input_dir)):
         if fname.startswith('_'):
@@ -82,32 +152,42 @@ def main():
             continue
 
         name_no_ext = os.path.splitext(fname)[0]
-        if classify_val(name_no_ext) != 'story':
-            summary['system_skipped'].append(fname)
-            continue
-
         out_json = os.path.join(args.output_dir, name_no_ext + '.json')
         try:
             info = extract_one(path, out_json)
         except Exception as e:
             print(f"  [ERR] {fname}: {e}")
             continue
+
+        # 没剧情条目就不写 JSON, inject 时这类文件会被原样拷贝
+        items = info.pop('_items')
+        if len(items) < args.min_items:
+            summary['no_story_skipped'].append(fname)
+            continue
+
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
         summary['story'].append(info)
-        total_refs += info['ref_count']
+        total_refs   += info['ref_count']
+        total_items  += info['item_count']
+        total_merged += info['merged_count']
 
     summary['totals'] = {
-        'story_files':     len(summary['story']),
-        'system_skipped':  len(summary['system_skipped']),
-        'total_text_refs': total_refs,
+        'story_files':       len(summary['story']),
+        'no_story_skipped':  len(summary['no_story_skipped']),
+        'total_text_refs':   total_refs,
+        'total_items':       total_items,
+        'total_merged':      total_merged,
     }
     with open(os.path.join(args.output_dir, '_extract_index.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"[OK] story={len(summary['story'])}, "
-          f"system_skipped={len(summary['system_skipped'])}, "
-          f"total_text_refs={total_refs}")
+          f"no_story={len(summary['no_story_skipped'])}, "
+          f"refs={total_refs}, items={total_items} (merged {total_merged})")
     print(f"     output -> {args.output_dir}")
 
 
 if __name__ == '__main__':
     main()
+

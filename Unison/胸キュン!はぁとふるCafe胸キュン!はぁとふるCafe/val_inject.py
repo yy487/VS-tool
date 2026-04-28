@@ -68,26 +68,28 @@ def inject_one(val_path: str, json_path: str, out_path: str,
     with open(json_path, 'r', encoding='utf-8') as f:
         items = json.load(f)
 
-    # 同一 idx 在 JSON 中可能出现多次 (剧情中复用同字符串).
-    # 策略: 首次出现为准; 若后续记录文本不同则警告 (但不强制中断).
-    first_text = {}    # idx -> 第一次见到的非空 message
-    conflicts = []     # (idx, first, later)
+    # 注入策略 (兼容三种条目形态):
+    #   形态 A: 旧版扁平条目 (无 _chunks). 直接按 _idx 写.
+    #   形态 B: 合并条目 (有 _chunks). 主译文写到 _chunks[0]._idx,
+    #           其余 chunk 的 _idx 写空字符串 (引擎执行那条 0xdd 时显示空,
+    #           分页节奏保留).
+    #   形态 C: 用户手动改了 _chunks[k].src (作为译文). 此时 src != orig,
+    #           按 chunk 各自的译文分别写, 不再用主 message 的整段.
+    #
+    # 所有写入按"首次为准 + 冲突警告"原则.
+    first_text = {}    # idx -> 已写文本 (用 str 存, 编码留到 build)
+    conflicts = []     # (idx, first_text, later_text)
     written = 0
-    warnings = []
-    for item in items:
-        idx = item.get('_idx')
-        if idx is None:
-            continue
+
+    def _write(idx: int, text: str):
+        """单点写入, 处理冲突检测."""
         if not (0 <= idx < len(v.strings)):
             raise ValueError(f"{os.path.basename(json_path)}: _idx {idx} out of range "
                              f"(strings={len(v.strings)})")
-        text = pick_text(item)
-        if not text:
-            continue
         if idx in first_text:
             if first_text[idx] != text:
                 conflicts.append((idx, first_text[idx], text))
-            continue   # 已写过, 跳过
+            return False
         first_text[idx] = text
         try:
             v.strings[idx] = text.encode(encoding)
@@ -96,8 +98,46 @@ def inject_one(val_path: str, json_path: str, out_path: str,
                 f"{os.path.basename(json_path)} idx={idx}: "
                 f"{encoding} encode failed: {text!r} ({e})"
             )
-        written += 1
+        return True
 
+    for item in items:
+        chunks = item.get('_chunks')
+        if chunks:
+            # 形态 B/C: 用 chunk 决定写到哪个 idx
+            translated = pick_text(item)
+            chunk_translations = []
+            for c in chunks:
+                # 如果 chunk.src 被用户手改 (与原文不同), 当作显式译文
+                # (这里没有"原文"参考列, 只能用 src 是否为空来判断)
+                cs = c.get('src', '')
+                chunk_translations.append(cs if cs else None)
+
+            # 决定主译文走哪种分配
+            user_edited_chunks = any(t is not None and t != '' for t in chunk_translations)
+            # 简化: 若主 message (translated) 非空, 第一段写整段, 其余写空
+            #       否则按 chunk.src 各自写 (兼容用户手动模式)
+            if translated:
+                for k, c in enumerate(chunks):
+                    if _write(c['_idx'], translated if k == 0 else ''):
+                        written += 1
+            else:
+                # 没主译文 -> 用 chunk.src 各自写
+                for c in chunks:
+                    src = c.get('src', '')
+                    if src and _write(c['_idx'], src):
+                        written += 1
+        else:
+            # 形态 A: 扁平
+            idx = item.get('_idx')
+            if idx is None:
+                continue
+            text = pick_text(item)
+            if not text:
+                continue
+            if _write(idx, text):
+                written += 1
+
+    warnings = []
     if conflicts:
         warnings.append(f"  [WARN] {os.path.basename(json_path)}: "
                         f"{len(conflicts)} idx-conflicts (kept first); "

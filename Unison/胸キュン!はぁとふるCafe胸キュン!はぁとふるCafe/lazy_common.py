@@ -43,45 +43,52 @@ from typing import List, Tuple, Dict, Optional
 # Yaki.VCT 中所有 .VAL 文件名首字母分布:
 #   A:6  C:204  D:2  E:1  G:1  H:16  L:1  M:3  O:1  S:2  T:107  W:34
 #
-# 系统脚本 (固定名, 不是连续编号系列):
-SYSTEM_NAMES = {
-    'LOAD', 'DEBUG', 'MAINMENU', 'MAKERTITLE', 'MUSICM',
-    'CGM', 'STAFFROLL', 'OMAKE', 'HSCENE', 'START',
-    'GAMEEND', 'SE', 'THUM', 'LOGO', 'CONFIG', 'OP',
-    'TITLE', 'ED',
-}
+# **重要的教训**:
+# 早期版本试图用文件名硬编码 SYSTEM_NAMES 做分类, 漏掉了 DEMO.VAL,
+# HCHIKA01..05, HCHIYORI01..05, HDOUBLE01..04 等 15 个文件 (近 2000 条剧情).
+# 因为这些文件名不是连续编号系列, 也不在固定系统名表里.
+#
+# 当前策略: 直接用"文件内容是否含日文剧情字符串"判断 -> 不会漏
+#
+# 兼容旧 API: classify_val(name_no_ext) 仍然返回 'story'/'system',
+# 但只用于无法读文件时的兜底; 推荐用 classify_val_file(path) 或
+# classify_val_data(bytes).
 
-# 剧情脚本前缀 (后接编号: C0101.VAL, TK0102.VAL, ...)
-STORY_PREFIXES = (
-    'C',     # C0101..C19xx 主线
-    'T',     # T*, TK*, TY* 支线
-    'W',     # W0101.. 支线
-    'H',     # H* (除 HSCENE)
-    'AY',    # AY 系列
-    'ED',    # ED 結局 (但 ED 可能是系统名)
-)
+# 已知纯系统脚本 (不含真实剧情, 仅用于兜底)
+SYSTEM_NAMES = {
+    'CGM', 'DEBUG', 'GAMEEND', 'HSCENE', 'LOAD', 'MAINMENU',
+    'MAKERTITLE', 'MUSICM', 'OMAKE', 'STAFFROLL', 'START',
+    'CONFIG', 'OP', 'TITLE', 'ED', 'SE', 'THUM', 'LOGO',
+}
 
 
 def classify_val(name_no_ext: str) -> str:
     """
-    判断 .VAL 文件是 'story' / 'system'.
-    name_no_ext: 不带扩展名的大写文件名, 例如 'C0101', 'LOAD'
+    按文件名做粗分类 (兜底用, 不读文件).
+    name_no_ext: 不带扩展名的文件名 (大小写均可).
+    返回 'story' / 'system'.
+
+    更可靠的判断推荐用 classify_val_data(bytes), 它直接看是否含日文.
     """
     n = name_no_ext.upper()
     if n in SYSTEM_NAMES:
         return 'system'
-    # 编号系列: 前缀字母 + 数字 -> 剧情
-    # 提取前缀字母部分
-    i = 0
-    while i < len(n) and n[i].isalpha():
-        i += 1
-    prefix = n[:i]
-    suffix = n[i:]
-    if prefix in ('C', 'T', 'TK', 'TY', 'W', 'H', 'AY', 'ED', 'HAYA'):
-        # 后缀必须是数字, 否则可能是系统名
-        if suffix.isdigit() and len(suffix) >= 2:
-            return 'story'
-    return 'system'
+    return 'story'
+
+
+def classify_val_data(data: bytes, min_jp_strings: int = 1) -> str:
+    """
+    按文件内容判断: 字符串池里至少有 min_jp_strings 条剧情字符串
+    (含日文假名/汉字 或 纯日式标点) 就归为 story.
+
+    这是最可靠的判定方式, 推荐使用.
+    """
+    try:
+        v = ValFile.parse(data)
+    except Exception:
+        return 'system'
+    n_jp = sum(1 for s in v.strings if is_story_text(s))
+    return 'story' if n_jp >= min_jp_strings else 'system'
 
 
 # ============================================================
