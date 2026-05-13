@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from snc_common import (
-    clean_msg, collect_strings, join_name_msg, load_snc, read_json,
+    clean_msg, collect_strings, join_name_msg, load_snc, normalize_extracted_message, read_json,
     rebuild_with_new_strings, split_name_msg,
 )
 
@@ -35,14 +35,16 @@ def _json_for_snc(json_root: Path, snc_path: Path) -> Path:
 
 
 def _entry_replacement(entry: dict) -> Tuple[int, str, str, str]:
-    """Return ref, expected_scr_msg, new_full_text, kind."""
+    """Return ref, normalized expected_scr_msg, new_full_text, kind."""
     ref = entry.get("_ref", entry.get("_string_ref"))
     if ref is None:
         raise KeyError("entry has no _ref")
     ref = int(ref)
     name = entry.get("name")
-    scr_msg = entry.get("scr_msg", "")
-    message = entry.get("message", entry.get("msg", scr_msg))
+    # scr_msg 和 message 在新版流程中都不保存正文内部 \n。
+    scr_msg = normalize_extracted_message(entry.get("scr_msg", ""))
+    message = normalize_extracted_message(entry.get("message", entry.get("msg", scr_msg)))
+    # join_name_msg 会自动补回 name 与 message 之间的唯一 \n。
     new_full = join_name_msg(name, message)
     return ref, scr_msg, new_full, entry.get("_kind", "message")
 
@@ -53,7 +55,6 @@ def build_replacements(
     *,
     encoding: str = "cp932",
     strict_scr_msg: bool = True,
-    strict_name: bool = False,
 ) -> Tuple[Dict[int, str], List[str]]:
     data, h, _words = load_snc(snc_path)
     old_strings = collect_strings(data, h, encoding)
@@ -77,9 +78,9 @@ def build_replacements(
                     warnings.append(f"choice at index {ent.get('_index')} missing _ref")
                     continue
                 ref = int(ref)
-                old = clean_msg(old_strings.get(ref, ""))
-                scr = ch.get("scr_msg", "")
-                msg = ch.get("message", ch.get("msg", scr))
+                old = normalize_extracted_message(old_strings.get(ref, ""))
+                scr = normalize_extracted_message(ch.get("scr_msg", ""))
+                msg = normalize_extracted_message(ch.get("message", ch.get("msg", scr)))
                 if strict_scr_msg and old != scr:
                     warnings.append(f"choice ref {ref}: scr_msg mismatch: old={old!r}, json={scr!r}; skipped")
                     continue
@@ -96,18 +97,13 @@ def build_replacements(
             warnings.append(f"entry index {ent.get('_index')} missing _ref; skipped")
             continue
         old_full = clean_msg(old_strings.get(ref, ""))
-        old_name, old_msg = split_name_msg(old_full)
-        old_scr = old_msg
-        json_name = ent.get("name")
+        old_name, old_msg = split_name_msg(old_full, allow_name=(ent.get("name") is not None), known_speakers=None)
+        old_scr = normalize_extracted_message(old_msg)
         if strict_scr_msg and old_scr != scr:
             warnings.append(f"ref {ref}: scr_msg mismatch: old={old_scr!r}, json={scr!r}; skipped")
             continue
-        # The JSON `name` field is treated as the target/injected speaker name.
-        # Translators may change ゆず -> 柚子, so do not use `name` as an
-        # original-text anchor unless --strict-name is explicitly requested.
-        if strict_name and json_name is not None and old_name != json_name:
-            warnings.append(f"ref {ref}: name mismatch: old={old_name!r}, json={json_name!r}; skipped")
-            continue
+        # name 是目标译名，不再作为原文校验字段。
+        # 原始 name 与 message 之间的 \n 会在 join_name_msg 中自动补回。
         replacements[ref] = new_full
 
     return replacements, warnings
@@ -121,12 +117,11 @@ def inject_one(
     encoding: str = "cp932",
     errors: str = "strict",
     strict_scr_msg: bool = True,
-    strict_name: bool = False,
     dry_run: bool = False,
 ) -> dict:
     data, h, _words = load_snc(snc_path)
     replacements, warnings = build_replacements(
-        snc_path, json_path, encoding=encoding, strict_scr_msg=strict_scr_msg, strict_name=strict_name
+        snc_path, json_path, encoding=encoding, strict_scr_msg=strict_scr_msg
     )
     if dry_run:
         return {
@@ -160,8 +155,7 @@ def main() -> int:
     ap.add_argument("output", type=Path, help="output .snc file or directory")
     ap.add_argument("--encoding", default="cp932")
     ap.add_argument("--errors", default="strict", choices=["strict", "replace", "ignore"], help="encoding error policy")
-    ap.add_argument("--no-strict-scr-msg", action="store_true", help="do not require scr_msg to match original text")
-    ap.add_argument("--strict-name", action="store_true", help="also require JSON name to match original speaker name; off by default so speaker names can be translated")
+    ap.add_argument("--no-strict-scr-msg", action="store_true", help="do not require normalized scr_msg to match original text")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -179,7 +173,7 @@ def main() -> int:
             try:
                 results.append(inject_one(
                     p, jp, out, encoding=args.encoding, errors=args.errors,
-                    strict_scr_msg=strict, strict_name=args.strict_name, dry_run=args.dry_run,
+                    strict_scr_msg=strict, dry_run=args.dry_run,
                 ))
             except Exception as e:
                 results.append({"file": p.name, "error": str(e)})
@@ -189,7 +183,7 @@ def main() -> int:
             out = args.output / args.input.name
         results.append(inject_one(
             args.input, args.json, out, encoding=args.encoding, errors=args.errors,
-            strict_scr_msg=strict, strict_name=args.strict_name, dry_run=args.dry_run,
+            strict_scr_msg=strict, dry_run=args.dry_run,
         ))
 
     print(json.dumps({"results": results}, ensure_ascii=False, indent=2))

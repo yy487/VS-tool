@@ -95,39 +95,105 @@ def encode_text(text: str, encoding: str = "cp932", errors: str = "strict") -> b
 
 
 def clean_msg(s: str) -> str:
-    # The scripts often keep one ASCII trailing blank as display padding.
+    # 脚本里部分字符串末尾会带一个 ASCII 空格作为显示 padding，提取/校验时去掉。
     return s.rstrip(" ")
 
 
-def split_name_msg(s: str) -> Tuple[Optional[str], str]:
-    """Split engine text into optional speaker name and message.
+def strip_message_newlines(s: str) -> str:
+    """Remove display line-break marks inside message text.
 
-    The raw SNC string often stores spoken lines as:
-        name\n「dialogue」
+    SNC 原始文本里用两个可见字符 ``\\n`` 表示显示换行。
+    当前本地化流程不再保留正文内部换行，全部交给游戏自动换行。
+    所以 JSON 里的 ``scr_msg`` / ``message`` 都会删除正文内部 ``\\n``。
 
-    Narration may also contain line breaks, so a bare first line must not be
-    treated as a name.  We only split when the first line is short and the
-    following text starts with a dialogue quote.
+    name 与 message 之间的分隔换行不在这里判断，由 split/join 专门处理。
+    """
+    return clean_msg(s).replace("\\n", "").replace("\r\n", "").replace("\n", "").replace("\r", "")
+
+
+def normalize_extracted_message(s: str) -> str:
+    """Normalize message for JSON output and scr_msg verification."""
+    return strip_message_newlines(s)
+
+
+def _looks_like_speaker_name(first: str) -> bool:
+    """Return whether the first line can be a speaker name.
+
+    这里只做非常保守的形态过滤；是否真正拆 name 由提取器传入的
+    指令流上下文决定。不要单靠文本中的 ``\\n`` 判断 name。
+    """
+    first = first.strip()
+    if not first:
+        return False
+    if len(first) > 12:
+        return False
+    if any(ch in first for ch in "「」『』。、？！….,!?;；：:（）()[]{}"):
+        return False
+    return True
+
+
+def split_name_msg(
+    s: str,
+    *,
+    allow_name: bool = False,
+    known_speakers: Optional[Iterable[str]] = None,
+) -> Tuple[Optional[str], str]:
+    """Split raw engine text into optional speaker name and raw message.
+
+    重要：人名识别必须由 VM 指令流驱动，不能再用“第一行 + 引号”
+    这种纯文本规则直接判断。
+
+    - allow_name=False：无论文本里有没有 ``\\n「``，都整体当旁白。
+    - allow_name=True ：只有短名字 + 后文以 「/『 开头时才允许拆。
+    - known_speakers 不为空时，非 voice 场景还要求 first 在已知人名表里。
+
+    返回的 message 仍保留原始内部 ``\\n``，提取到 JSON 前再删除。
     """
     s = clean_msg(s)
-    if "\\n" in s:
-        first, rest = s.split("\\n", 1)
-        rest_l = rest.lstrip()
-        if (
-            first
-            and len(first) <= 24
-            and "「" not in first
-            and "」" not in first
-            and "『" not in first
-            and "』" not in first
-            and rest_l.startswith(("「", "『"))
-        ):
-            return first, rest
-    return None, s
+    if not allow_name or "\\n" not in s:
+        return None, s
+    first, rest = s.split("\\n", 1)
+    rest_l = rest.lstrip()
+    if not rest_l.startswith(("「", "『")):
+        return None, s
+    if not _looks_like_speaker_name(first):
+        return None, s
+    if known_speakers is not None:
+        speakers = set(known_speakers)
+        if first.strip() not in speakers:
+            return None, s
+    return first, rest
 
 
 def join_name_msg(name: Optional[str], msg: str) -> str:
+    """Build raw engine text for injection.
+
+    注入时自动补回 name 与 message 之间的唯一 ``\\n``；
+    message 内部的换行仍然删除，依赖游戏自动换行。
+    """
+    msg = strip_message_newlines(msg)
     return f"{name}\\n{msg}" if name else msg
+
+
+def is_likely_text(s: str) -> bool:
+    """Return True for strings that are likely visible story/menu text."""
+    t = clean_msg(s)
+    if is_likely_resource(t):
+        return False
+    if not t or not any(ord(ch) > 0x7F for ch in t):
+        return False
+    # 这里只做“文本候选”判断，不删除换行；换行规范化在提取/注入阶段处理。
+    jp_marks = (
+        "ぁあいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほ"
+        "まみむめもやゆよらりるれろわをん"
+        "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホ"
+        "マミムメモヤユヨラリルレロワヲン"
+        "。「」『』？！……、ーっッゃゅょャュョ"
+    )
+    if any(ch in t for ch in jp_marks):
+        return True
+    # 少量纯汉字片段也可能是剧情/人名文本，资源名已在前面过滤。
+    return any("\u4e00" <= ch <= "\u9fff" for ch in t)
 
 
 def is_likely_resource(s: str) -> bool:
