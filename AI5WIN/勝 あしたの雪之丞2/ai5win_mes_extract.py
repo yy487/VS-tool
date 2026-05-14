@@ -87,7 +87,7 @@ def _collect_speaker_segments(ops, text_entries):
 
     只有出现两个及以上 name+body 起点时才启用。
     普通 name+message、同一角色多 TEXT 分段，仍交给原有逻辑处理。
-    返回: [(name, message, name_text_index, msg_text_indices)] 或 []。
+    返回: [(name, message, name_text_index, msg_text_indices, msg_parts)] 或 []。
     """
     starts = [i for i in range(len(text_entries)) if _is_name_start(ops, text_entries, i)]
     if len(starts) < 2:
@@ -99,29 +99,23 @@ def _collect_speaker_segments(ops, text_entries):
         msg_positions = list(range(start_pos + 1, next_start))
         if not msg_positions:
             continue
-        msg = ''.join(text_entries[p][1] for p in msg_positions)
+        msg_parts = [text_entries[p][1] for p in msg_positions]
+        msg = ''.join(msg_parts)
         msg_text_indices = [text_entries[p][0] for p in msg_positions]
-        segments.append((name, msg, text_entries[start_pos][0], msg_text_indices))
+        segments.append((name, msg, text_entries[start_pos][0], msg_text_indices, msg_parts))
     return segments
 
 
-def _collect_block(block_ops, dec=None):
-    """从块内 ops 抓文本.
-    返回 (name, message, choices, chapter_title)
+def _collect_block_detailed(block_ops, dec=None):
+    """从块内 ops 抓文本，并保留正文 TEXT 分段信息。
 
-    dec: 保留参数仅为兼容旧调用，不参与显示模式推断。
-
-    识别规则:
-      - "选择支 TEXT" (choices):
-          CH_POS (op 0x0e) 后紧跟的 TEXT (op 0x01). 例: '●水島を刺激する...'
-      - "章节标题" (chapter_title):
-          独立的 MENU_SET (op 0x10) 里的合法 STR slot (过滤含 \n 的名前标签).
-      - "名前 + 台词":
-          块首 TEXT 后紧跟 0x11 INTERRUPT: 首 TEXT=name, 下一个非选择支 TEXT=message.
-          否则块首 TEXT 就是 message.
+    返回 (name, message, message_parts, choices, chapter_title)。
+    公开 JSON 仍以 id/name?/scr_msg/message 为主；只有同一句由多段 TEXT
+    拼成时，调用方才额外写出 scr_msg_parts/message_parts。
     """
     name = None
     message = None
+    message_parts = []
     choices = []
     chapter_title = None
     ops = list(block_ops)
@@ -153,7 +147,8 @@ def _collect_block(block_ops, dec=None):
             return False
         if first_text.startswith(_NAME_FORBID_PREFIX):
             return False
-        want = first_text.encode('cp932', errors='ignore') + b'\\n'
+        want1 = first_text.encode('cp932', errors='ignore') + b'\\n'
+        want2 = first_text.encode('cp932', errors='ignore') + b'\n'
         j = first_idx + 2
         while j < len(ops):
             opj = ops[j][1]
@@ -166,7 +161,7 @@ def _collect_block(block_ops, dec=None):
                     if typ != 'SLOTS':
                         continue
                     for sl in val:
-                        if sl[0] == 'STR' and (sl[3] == want or sl[3] == first_text.encode('cp932', errors='ignore') + b'\n'):
+                        if sl[0] == 'STR' and (sl[3] == want1 or sl[3] == want2):
                             return True
             j += 1
         return False
@@ -176,11 +171,13 @@ def _collect_block(block_ops, dec=None):
         has_name_marker = _has_name_marker(first_idx, first_text)
         if has_name_marker and len(text_entries) >= 2:
             name = first_text
-            message = ''.join(t for _, t in text_entries[1:])
+            message_parts = [t for _, t in text_entries[1:]]
+            message = ''.join(message_parts)
         elif has_name_marker:
             name = first_text
         else:
-            message = ''.join(t for _, t in text_entries)
+            message_parts = [t for _, t in text_entries]
+            message = ''.join(message_parts)
 
     # 3. 章节标题 (过滤含 \n 的名前标签)
     for (off, op, args, _) in ops:
@@ -201,8 +198,13 @@ def _collect_block(block_ops, dec=None):
                 except:
                     pass
 
-    return name, message, choices, chapter_title
+    return name, message, message_parts, choices, chapter_title
 
+
+def _collect_block(block_ops, dec=None):
+    """兼容旧调用：返回 (name, message, choices, chapter_title)。"""
+    name, message, _parts, choices, chapter_title = _collect_block_detailed(block_ops, dec)
+    return name, message, choices, chapter_title
 
 def extract_file(mes_path, json_path, verbose=True):
     compressed = open(mes_path, 'rb').read()
@@ -260,17 +262,24 @@ def extract_file(mes_path, json_path, verbose=True):
         segments = _collect_speaker_segments(ops_l, text_entries)
 
         if segments:
-            for nm, msg, _name_idx, _msg_indices in segments:
-                entries.append({"id": block_id, "name": nm, "scr_msg": msg or "", "message": msg or ""})
+            for nm, msg, _name_idx, _msg_indices, msg_parts in segments:
+                ent = {"id": block_id, "name": nm, "scr_msg": msg or "", "message": msg or ""}
+                if len(msg_parts) > 1:
+                    ent["scr_msg_parts"] = list(msg_parts)
+                    ent["message_parts"] = list(msg_parts)
+                entries.append(ent)
             # 多发言块仍保留选择支/章节标题的旧逻辑，虽然正常不会同时出现。
             _, _, chs, ct = _collect_block(ops, dec)
         else:
-            nm, msg, chs, ct = _collect_block(ops, dec)
+            nm, msg, msg_parts, chs, ct = _collect_block_detailed(ops, dec)
             # 1. 正文台词：统一输出 scr_msg/message；name 为空时不输出 name 字段
             if nm or msg:
                 ent = {"id": block_id, "scr_msg": msg or "", "message": msg or ""}
                 if nm:
                     ent = {"id": block_id, "name": nm, "scr_msg": msg or "", "message": msg or ""}
+                if len(msg_parts) > 1:
+                    ent["scr_msg_parts"] = list(msg_parts)
+                    ent["message_parts"] = list(msg_parts)
                 entries.append(ent)
 
         # 2. 每个选择支作为独立 entry，保留选项标记符

@@ -302,6 +302,64 @@ _RES_EXTS_FOR_INJ = (b'.g24', b'.msk', b'.ogg', b'.wav', b'.bmp', b'.png',
 
 
 
+def _message_part_from_entry(rep_info, te):
+    """根据 JSON entry 和 rep_info 取得本段应写入的译文。
+
+    规则：
+      - 没有 message_parts：沿用旧逻辑，第一段写完整 message，后续 tail 清空。
+      - 有 message_parts：要求 ''.join(message_parts) == message；然后按 part_idx 分段写回。
+        这样可以保留原脚本 TEXT[0]/TEXT[1] 的显示、语音和演出节奏。
+    """
+    old = rep_info.get('old_text') or ''
+    old_full = rep_info.get('message_combined_old') or old
+    msg = te.get('message', te.get('msg'))
+    scr = te.get('scr_msg')
+    if scr is not None and scr != old_full:
+        return None
+
+    parts = te.get('message_parts')
+    if parts is None:
+        # 兼容旧 JSON：第一段写完整 message，后续段清空。
+        if not msg or msg == old_full:
+            return None
+        if rep_info.get('role') == 'message_tail':
+            return ''
+        return msg
+
+    if not isinstance(parts, list) or not all(isinstance(x, str) for x in parts):
+        raise ValueError(
+            f"id={rep_info.get('id')} 的 message_parts 必须是字符串数组"
+        )
+    if msg is None:
+        raise ValueError(
+            f"id={rep_info.get('id')} 存在 message_parts 但没有 message 字段"
+        )
+    joined = ''.join(parts)
+    if joined != msg:
+        raise ValueError(
+            f"id={rep_info.get('id')} message 与 message_parts 不一致:\n"
+            f"  message     = {msg!r}\n"
+            f"  join(parts) = {joined!r}"
+        )
+
+    scr_parts = te.get('scr_msg_parts')
+    if scr_parts is not None:
+        if not isinstance(scr_parts, list) or not all(isinstance(x, str) for x in scr_parts):
+            raise ValueError(
+                f"id={rep_info.get('id')} 的 scr_msg_parts 必须是字符串数组"
+            )
+        if ''.join(scr_parts) != old_full:
+            return None
+
+    part_idx = rep_info.get('message_part_idx', 0)
+    if part_idx >= len(parts):
+        raise ValueError(
+            f"id={rep_info.get('id')} message_parts 段数不足: "
+            f"需要第 {part_idx + 1} 段, 实际 {len(parts)} 段"
+        )
+    return parts[part_idx]
+
+
 def _pick_replacement(rep_info, trans_bucket):
     """按 rep 的 role 到对应 bucket slot 取译文. 返回 str 或 None.
 
@@ -318,7 +376,6 @@ def _pick_replacement(rep_info, trans_bucket):
         texts = trans_bucket.get('texts') or []
         if 0 <= idx < len(texts):
             return texts[idx]
-        # 兼容极旧 bucket 结构
         return trans_bucket.get('text')
 
     if role == 'name':
@@ -328,28 +385,12 @@ def _pick_replacement(rep_info, trans_bucket):
             if new and new != old:
                 return new
         return None
-    if role == 'message':
+    if role in ('message', 'message_tail'):
         te = get_text_entry()
         if te:
-            new = te.get('message', te.get('msg'))
-            old_full = rep_info.get('message_combined_old') or old
-            # 有 scr_msg 时优先用 scr_msg 校验，避免同 id 多条 entry 误套。
-            scr = te.get('scr_msg')
-            if scr is not None and scr != old_full:
-                return None
-            if new and new != old_full:
+            new = _message_part_from_entry(rep_info, te)
+            if new is not None and new != old:
                 return new
-        return None
-    if role == 'message_tail':
-        te = get_text_entry()
-        if te:
-            new = te.get('message', te.get('msg'))
-            old_full = rep_info.get('message_combined_old') or old
-            scr = te.get('scr_msg')
-            if scr is not None and scr != old_full:
-                return None
-            if new and new != old_full:
-                return ''
         return None
     if role == 'choice':
         idx = rep_info.get('choice_idx', 0)
@@ -367,7 +408,6 @@ def _pick_replacement(rep_info, trans_bucket):
                 return new
         return None
     return None
-
 
 def _build_replacements(reps, td, mapper):
     """td: {id: bucket}. bucket = {'text', 'choices', 'title'}.
