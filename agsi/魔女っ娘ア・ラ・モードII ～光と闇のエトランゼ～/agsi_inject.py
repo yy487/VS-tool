@@ -3,6 +3,9 @@
 
 只修改已有 CSTR index 的内容，然后重建 CSTR_decode.bin / CSTR.bin。
 不修改 CODE.bin，不新增/删除 CSTR index。
+
+同一个 _cstr_id 在 JSON 中重复出现时，默认要求 message 完全一致；
+如果不同，直接报错，避免“last one wins”静默覆盖。
 """
 from __future__ import annotations
 
@@ -20,7 +23,6 @@ from agsi_common import (
 
 
 def normalize_text(s: str) -> str:
-    # JSON 中 scr_msg/message 不应包含 C 字符串结尾 NUL。
     return s.rstrip("\x00")
 
 
@@ -38,17 +40,19 @@ def inject(
     char_map_path: Path | None = None,
     allow_scr_mismatch: bool = False,
     backup: bool = True,
+    duplicate_policy: str = "error",
 ) -> dict:
     cstr_entries = read_cstr_decode(dump_dir, encoding=encoding)
     raw_entries = [e.raw for e in cstr_entries]
     char_map = load_char_map(char_map_path)
     items = load_items(json_path)
 
-    changed = 0
     touched: set[int] = set()
     assigned_text: dict[int, str] = {}
+    first_json_index: dict[int, int] = {}
     warnings: list[str] = []
 
+    # 第一遍：校验并合并每个 _cstr_id 的最终文本。
     for pos, item in enumerate(items):
         if not isinstance(item, dict):
             warnings.append(f"skip non-object item at json index {pos}")
@@ -70,11 +74,30 @@ def inject(
                 f"Use --allow-scr-mismatch only if you know what you are doing."
             )
         new_text = normalize_text(str(item.get("message", scr_msg)))
-        if sid in assigned_text and assigned_text[sid] != new_text:
-            warnings.append(
-                f"conflicting duplicate _cstr_id={sid}; previous={assigned_text[sid]!r}, current={new_text!r}; last one wins"
-            )
+
+        if sid in assigned_text:
+            prev = assigned_text[sid]
+            if prev != new_text:
+                msg = (
+                    f"conflicting duplicate _cstr_id={sid}; "
+                    f"first_json_index={first_json_index[sid]}, current_json_index={pos}; "
+                    f"previous={prev!r}, current={new_text!r}"
+                )
+                if duplicate_policy == "error":
+                    raise ValueError(msg + "; re-extract with the fixed extractor or make duplicate messages identical")
+                if duplicate_policy == "first":
+                    warnings.append(msg + "; first one kept")
+                    continue
+                if duplicate_policy == "last":
+                    warnings.append(msg + "; last one wins")
+                elif duplicate_policy == "same":
+                    raise ValueError(msg + "; --duplicate-policy same requires identical messages")
+        else:
+            first_json_index[sid] = pos
         assigned_text[sid] = new_text
+
+    changed = 0
+    for sid, new_text in assigned_text.items():
         new_raw = encode_text_checked(new_text, sid, encoding, char_map)
         if new_raw != raw_entries[sid]:
             raw_entries[sid] = new_raw
@@ -89,6 +112,7 @@ def inject(
         "changed": changed,
         "encoding": encoding,
         "char_map": str(char_map_path) if char_map_path else None,
+        "duplicate_policy": duplicate_policy,
         "warnings": warnings[:50],
         "warning_count": len(warnings),
     })
@@ -103,6 +127,12 @@ def main() -> None:
     parser.add_argument("--char-map", help="可选：单字映射 JSON，例如 subs_cn_jp.json")
     parser.add_argument("--allow-scr-mismatch", action="store_true", help="允许 scr_msg 与当前 CSTR 不一致")
     parser.add_argument("--no-backup", action="store_true", help="不生成 CSTR.bin.bak / CSTR_decode.bin.bak")
+    parser.add_argument(
+        "--duplicate-policy",
+        choices=["error", "first", "last", "same"],
+        default="error",
+        help="同一 _cstr_id 出现不同 message 时的处理方式；默认 error，避免静默覆盖",
+    )
     args = parser.parse_args()
 
     report = inject(
@@ -112,6 +142,7 @@ def main() -> None:
         char_map_path=Path(args.char_map) if args.char_map else None,
         allow_scr_mismatch=args.allow_scr_mismatch,
         backup=not args.no_backup,
+        duplicate_policy=args.duplicate_policy,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
